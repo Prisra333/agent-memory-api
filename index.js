@@ -1,21 +1,25 @@
-const { Redis } = require("@upstash/redis");
-
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN,
-});
-
+const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
+const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 const WALLET = process.env.WALLET_ADDRESS;
 
-function cors(res) {
+async function redis(cmd) {
+  const r = await fetch(`${REDIS_URL}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${REDIS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(cmd),
+  });
+  const j = await r.json();
+  return j.result;
+}
+
+module.exports = async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-PAYMENT, X-PAYMENT-RESPONSE");
   res.setHeader("Content-Type", "application/json");
-}
-
-module.exports = async function handler(req, res) {
-  cors(res);
   if (req.method === "OPTIONS") return res.status(200).end();
 
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -25,8 +29,7 @@ module.exports = async function handler(req, res) {
     return res.status(200).json({ status: "ok", service: "agent-memory-api" });
   }
 
-  const payment = req.headers["x-payment"];
-  if (!payment) {
+  if (!req.headers["x-payment"]) {
     return res.status(402).json({
       error: "Payment required",
       price: "0.001 USDC",
@@ -52,36 +55,38 @@ module.exports = async function handler(req, res) {
       const { data, ttl } = body;
       if (!data) return res.status(400).json({ error: "data is required" });
       const key = `agent:${agentId}:state`;
-      ttl ? await redis.setex(key, ttl, JSON.stringify(data)) : await redis.set(key, JSON.stringify(data));
-      return res.status(200).json({ ok: true, agent_id: agentId, key });
+      const val = JSON.stringify(data);
+      await redis(ttl ? ["SETEX", key, ttl, val] : ["SET", key, val]);
+      return res.status(200).json({ ok: true, agent_id: agentId });
     }
 
     if (path === "/api/load" && req.method === "GET") {
       const key = `agent:${agentId}:state`;
-      const raw = await redis.get(key);
+      const raw = await redis(["GET", key]);
       if (!raw) return res.status(404).json({ error: "No state found" });
-      return res.status(200).json({ ok: true, agent_id: agentId, data: typeof raw === "string" ? JSON.parse(raw) : raw });
+      return res.status(200).json({ ok: true, agent_id: agentId, data: JSON.parse(raw) });
     }
 
     if (path === "/api/append" && req.method === "POST") {
       const { entry } = body;
       if (!entry) return res.status(400).json({ error: "entry is required" });
       const key = `agent:${agentId}:log`;
-      await redis.lpush(key, JSON.stringify({ ts: new Date().toISOString(), entry }));
-      await redis.ltrim(key, 0, 99);
+      await redis(["LPUSH", key, JSON.stringify({ ts: new Date().toISOString(), entry })]);
+      await redis(["LTRIM", key, 0, 99]);
       return res.status(200).json({ ok: true, agent_id: agentId });
     }
 
     if (path === "/api/logs" && req.method === "GET") {
       const key = `agent:${agentId}:log`;
-      const raw = await redis.lrange(key, 0, 19);
-      return res.status(200).json({ ok: true, agent_id: agentId, logs: raw.map(r => JSON.parse(r)) });
+      const raw = await redis(["LRANGE", key, 0, 19]);
+      return res.status(200).json({ ok: true, agent_id: agentId, logs: (raw || []).map(r => JSON.parse(r)) });
     }
 
     if (path === "/api/flush" && req.method === "POST") {
-      await redis.del(`agent:${agentId}:state`);
-      await redis.del(`agent:${agentId}:log`);
-      return res.status(200).json({ ok: true, agent_id: agentId, message: "Flushed" });
+      const aid = (body && body.agent_id) || "default";
+      await redis(["DEL", `agent:${aid}:state`]);
+      await redis(["DEL", `agent:${aid}:log`]);
+      return res.status(200).json({ ok: true, agent_id: aid, message: "Flushed" });
     }
 
     return res.status(404).json({ error: "Not found" });

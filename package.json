@@ -1,8 +1,8 @@
 {
   "name": "agent-memory-api",
   "version": "1.0.0",
-  "private": true,
-  "scripts": {
-    "start": "node index.js"
+  "type": "module",
+  "dependencies": {
+    "@upstash/redis": "^1.34.0"
   }
 }

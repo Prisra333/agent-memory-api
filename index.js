@@ -16,8 +16,6 @@ async function redis(cmd) {
 
 module.exports = async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-API-KEY");
   res.setHeader("Content-Type", "application/json");
   if (req.method === "OPTIONS") return res.status(200).end();
 
@@ -25,13 +23,17 @@ module.exports = async function handler(req, res) {
   const path = url.pathname;
 
   if (path === "/api/health") {
-    return res.status(200).json({ status: "ok", service: "agent-memory-api" });
+    return res.status(200).json({ status: "ok", key_loaded: !!API_KEY });
   }
 
-  // 認証
-  const key = req.headers["x-api-key"];
-  if (!key || key !== API_KEY) {
-    return res.status(401).json({ error: "Unauthorized" });
+  // ヘッダーをデバッグ
+  if (path === "/api/debug") {
+    return res.status(200).json({ headers: req.headers });
+  }
+
+  const incoming = req.headers["x-api-key"];
+  if (!incoming || incoming !== API_KEY) {
+    return res.status(401).json({ error: "Unauthorized", incoming, expected_length: API_KEY ? API_KEY.length : 0 });
   }
 
   const body = req.method !== "GET" ? req.body : {};
@@ -39,7 +41,6 @@ module.exports = async function handler(req, res) {
   const hashKey = `agent:${agentId}`;
 
   try {
-    // スナップショット取得（state + 直近ログを1回で）
     if (path === "/api/snapshot" && req.method === "GET") {
       const [state, logs] = await Promise.all([
         redis(["HGETALL", hashKey]),
@@ -52,27 +53,18 @@ module.exports = async function handler(req, res) {
           catch { data[state[i]] = state[i + 1]; }
         }
       }
-      return res.status(200).json({
-        ok: true,
-        agent_id: agentId,
-        state: data,
-        logs: (logs || []).map(l => JSON.parse(l)),
-      });
+      return res.status(200).json({ ok: true, agent_id: agentId, state: data, logs: (logs || []).map(l => JSON.parse(l)) });
     }
 
-    // 差分保存（変わった部分だけ更新）
     if (path === "/api/save" && req.method === "POST") {
       const { data } = body;
       if (!data) return res.status(400).json({ error: "data is required" });
       const args = ["HSET", hashKey];
-      for (const [k, v] of Object.entries(data)) {
-        args.push(k, JSON.stringify(v));
-      }
+      for (const [k, v] of Object.entries(data)) args.push(k, JSON.stringify(v));
       await redis(args);
       return res.status(200).json({ ok: true, agent_id: agentId });
     }
 
-    // ログ追記
     if (path === "/api/append" && req.method === "POST") {
       const { entry } = body;
       if (!entry) return res.status(400).json({ error: "entry is required" });
@@ -82,7 +74,6 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({ ok: true, agent_id: agentId });
     }
 
-    // リセット
     if (path === "/api/flush" && req.method === "POST") {
       await redis(["DEL", hashKey]);
       await redis(["DEL", `${hashKey}:log`]);

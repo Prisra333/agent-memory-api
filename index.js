@@ -1,9 +1,9 @@
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
-const WALLET = process.env.WALLET_ADDRESS;
+const API_KEY = process.env.MEMORY_API_KEY;
 
 async function redis(cmd) {
-  const r = await fetch(`${REDIS_URL}`, {
+  const r = await fetch(REDIS_URL, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${REDIS_TOKEN}`,
@@ -11,14 +11,13 @@ async function redis(cmd) {
     },
     body: JSON.stringify(cmd),
   });
-  const j = await r.json();
-  return j.result;
+  return (await r.json()).result;
 }
 
 module.exports = async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-PAYMENT, X-PAYMENT-RESPONSE");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-API-KEY");
   res.setHeader("Content-Type", "application/json");
   if (req.method === "OPTIONS") return res.status(200).end();
 
@@ -29,64 +28,65 @@ module.exports = async function handler(req, res) {
     return res.status(200).json({ status: "ok", service: "agent-memory-api" });
   }
 
-  if (!req.headers["x-payment"]) {
-    return res.status(402).json({
-      error: "Payment required",
-      price: "0.001 USDC",
-      accepts: [{
-        scheme: "exact",
-        network: "base",
-        maxAmountRequired: "1000000000000000",
-        resource: req.url,
-        description: "Agent Memory API - 1 operation",
-        mimeType: "application/json",
-        payTo: WALLET,
-        maxTimeoutSeconds: 300,
-        asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-      }],
-    });
+  // 認証
+  const key = req.headers["x-api-key"];
+  if (!key || key !== API_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
   }
 
   const body = req.method !== "GET" ? req.body : {};
-  const agentId = (body && body.agent_id) || url.searchParams.get("agent_id") || "default";
+  const agentId = (body && body.agent_id) || url.searchParams.get("agent_id") || "rimuru";
+  const hashKey = `agent:${agentId}`;
 
   try {
+    // スナップショット取得（state + 直近ログを1回で）
+    if (path === "/api/snapshot" && req.method === "GET") {
+      const [state, logs] = await Promise.all([
+        redis(["HGETALL", hashKey]),
+        redis(["LRANGE", `${hashKey}:log`, 0, 9]),
+      ]);
+      const data = {};
+      if (state) {
+        for (let i = 0; i < state.length; i += 2) {
+          try { data[state[i]] = JSON.parse(state[i + 1]); }
+          catch { data[state[i]] = state[i + 1]; }
+        }
+      }
+      return res.status(200).json({
+        ok: true,
+        agent_id: agentId,
+        state: data,
+        logs: (logs || []).map(l => JSON.parse(l)),
+      });
+    }
+
+    // 差分保存（変わった部分だけ更新）
     if (path === "/api/save" && req.method === "POST") {
-      const { data, ttl } = body;
+      const { data } = body;
       if (!data) return res.status(400).json({ error: "data is required" });
-      const key = `agent:${agentId}:state`;
-      const val = JSON.stringify(data);
-      await redis(ttl ? ["SETEX", key, ttl, val] : ["SET", key, val]);
+      const args = ["HSET", hashKey];
+      for (const [k, v] of Object.entries(data)) {
+        args.push(k, JSON.stringify(v));
+      }
+      await redis(args);
       return res.status(200).json({ ok: true, agent_id: agentId });
     }
 
-    if (path === "/api/load" && req.method === "GET") {
-      const key = `agent:${agentId}:state`;
-      const raw = await redis(["GET", key]);
-      if (!raw) return res.status(404).json({ error: "No state found" });
-      return res.status(200).json({ ok: true, agent_id: agentId, data: JSON.parse(raw) });
-    }
-
+    // ログ追記
     if (path === "/api/append" && req.method === "POST") {
       const { entry } = body;
       if (!entry) return res.status(400).json({ error: "entry is required" });
-      const key = `agent:${agentId}:log`;
-      await redis(["LPUSH", key, JSON.stringify({ ts: new Date().toISOString(), entry })]);
-      await redis(["LTRIM", key, 0, 99]);
+      const logKey = `${hashKey}:log`;
+      await redis(["LPUSH", logKey, JSON.stringify({ ts: new Date().toISOString(), entry })]);
+      await redis(["LTRIM", logKey, 0, 49]);
       return res.status(200).json({ ok: true, agent_id: agentId });
     }
 
-    if (path === "/api/logs" && req.method === "GET") {
-      const key = `agent:${agentId}:log`;
-      const raw = await redis(["LRANGE", key, 0, 19]);
-      return res.status(200).json({ ok: true, agent_id: agentId, logs: (raw || []).map(r => JSON.parse(r)) });
-    }
-
+    // リセット
     if (path === "/api/flush" && req.method === "POST") {
-      const aid = (body && body.agent_id) || "default";
-      await redis(["DEL", `agent:${aid}:state`]);
-      await redis(["DEL", `agent:${aid}:log`]);
-      return res.status(200).json({ ok: true, agent_id: aid, message: "Flushed" });
+      await redis(["DEL", hashKey]);
+      await redis(["DEL", `${hashKey}:log`]);
+      return res.status(200).json({ ok: true, agent_id: agentId, message: "Flushed" });
     }
 
     return res.status(404).json({ error: "Not found" });
